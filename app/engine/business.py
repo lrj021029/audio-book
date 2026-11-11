@@ -5,6 +5,11 @@ from ..retrieval import retrieve
 from ..llm import rag_reply
 log=logging.getLogger('listen_cs.engine.actions')
 
+
+class BusinessRuleError(ValueError):
+    """A deterministic business rejection that should reset the current flow."""
+
+
 def normalize_object(obj):
     if not isinstance(obj,dict):return None
     return {**obj,'type':str(obj.get('type') or 'unknown'),'id':obj.get('id'),'title':obj.get('title') or str(obj.get('id') or '未命名对象'),'subtitle':obj.get('subtitle') or '', 'cover_url':obj.get('cover_url') or obj.get('coverUrl')}
@@ -130,7 +135,10 @@ def answer(intent,text,user_id=None,focused_object=None,slots=None):
                     album_id=rows[0].get('album',{}).get('albumId')
                     detail=c.get(f'/api/v1/albums/{album_id}') if album_id else {}
                     album=detail.get('album',{}); narrators=detail.get('narrators',[])
-                    return f"《{album.get('albumTitle',rows[0].get('title'))}》共 {album.get('trackCount',0)} 集，主播 {narrators[0].get('narratorName','未提供') if narrators else '未提供'}，总时长 {album.get('totalDurationSeconds',0)//60} 分钟。\n简介：{album.get('summary','暂无简介')}\n来源：业务数据（audio_album、audio_track）"
+                    authors=detail.get('authors',[])
+                    rating=album.get('ratingScore',rows[0].get('ratingScore','未提供'))
+                    author=authors[0].get('authorName','未提供') if authors else '未提供'
+                    return f"《{album.get('albumTitle',rows[0].get('title'))}》评分 {rating}，共 {album.get('trackCount',0)} 集，作者 {author}，主播 {narrators[0].get('narratorName','未提供') if narrators else '未提供'}，总时长 {album.get('totalDurationSeconds',0)//60} 分钟。\n简介：{album.get('summary','暂无简介')}\n来源：业务数据（audio_album、audio_track）"
                 return f'暂未在当前样本中检索到《{title}》。来源：业务数据（audio_album）'
             tag_id=None
             tags=c.get('/api/v1/tags',tagType='genre').get('tags',[])
@@ -187,17 +195,31 @@ def execute(task,slots,user_id=None):
         orders=c.get('/api/v1/orders',pageSize=100); key=slots['order_id']
         row=next((x for x in orders.get('list',[]) if x.get('orderNo')==key or str(x.get('orderId'))==key),None)
         order_id=row['orderId'] if row else (int(key[3:]) if key.startswith('ORD') and key[3:].isdigit() else int(key) if key.isdigit() else None)
-        if order_id is None: raise ValueError('未找到该订单')
+        if order_id is None: raise BusinessRuleError('未找到该订单')
         detail=c.get(f'/api/v1/orders/{order_id}')
-        if detail['order'].get('orderNo') != key and str(detail['order'].get('orderId')) != key: raise ValueError('订单号与当前用户不匹配')
+        order=detail.get('order') or {}
+        if order.get('orderNo') != key and str(order.get('orderId')) != key:
+            raise BusinessRuleError('订单号与当前用户不匹配')
+        status=order.get('orderStatus')
+        if status and status != 'paid':
+            raise BusinessRuleError(f'订单当前状态为 {status}，不能申请退款')
         pay=next((p for p in detail.get('payments',[]) if p.get('paymentStatus')=='success'),None)
-        if not pay: raise ValueError('订单没有可退款的成功支付记录')
+        if not pay: raise BusinessRuleError('订单没有可退款的成功支付记录')
         if slots.get('refund_type')=='partial':
-            amount=float(slots['refund_amount'])
-            first=detail.get('items',[])[0]
+            try:
+                amount=float(slots['refund_amount'])
+            except (KeyError, TypeError, ValueError):
+                raise BusinessRuleError('退款金额格式不正确')
+            items_detail=detail.get('items',[])
+            if not items_detail:
+                raise BusinessRuleError('订单没有可退款的商品明细')
+            first=items_detail[0]
             items=[{'orderItemId':first['itemId'],'refundQuantity':first['quantity'],'refundAmount':amount}]
         else:
-            items=[{'orderItemId':i['itemId'],'refundQuantity':i['quantity'],'refundAmount':i['payableAmount']} for i in detail.get('items',[])]
+            items_detail=detail.get('items',[])
+            if not items_detail:
+                raise BusinessRuleError('订单没有可退款的商品明细')
+            items=[{'orderItemId':i['itemId'],'refundQuantity':i['quantity'],'refundAmount':i['payableAmount']} for i in items_detail]
         data=c.post('/api/v1/refunds',{'paymentId':pay['paymentId'],'refundReason':slots['reason'],'items':items})
         return f"退款申请已提交，退款单号 {data['refund']['refundNo']}，状态 {data['refund']['refundStatus']}。",'业务数据（refund_record）'
     allowed={'feature_feedback','usage_feedback','copyright_complaint','payment_issue','account_issue','content_issue','other'}

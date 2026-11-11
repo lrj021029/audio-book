@@ -26,5 +26,29 @@ def classify_intent(text):
     top=ranked[0]; runner=ranked[1] if len(ranked)>1 else (None,.0)
     if len(ranked)>1 and top[1]==runner[1]: return {'intent':'unknown','track':'chitchat','confidence':top[1],'runner_up':runner[0],'margin':0}
     return {'intent':top[0],'track':INTENT_TRACK[top[0]],'confidence':top[1],'runner_up':runner[0],'margin':round(top[1]-runner[1],2)}
+
+
+def classify_intents(text):
+    """Return business intents ordered by their first mention in the message.
+
+    This is only used by the deterministic planner fallback. The LLM path is
+    free to produce a more nuanced ordered task queue.
+    """
+    s = text.lower()
+    if any(q in s for q in ('会员能退款吗', '会员可以退款吗', '会员退款规则', '能不能退款', '退款规则')):
+        return ['faq']
+    hits = []
+    for intent, words in RULES.items():
+        positions = [s.find(word.lower()) for word in words if word.lower() in s]
+        if positions:
+            hits.append((min(positions), intent))
+    hits.sort(key=lambda item: item[0])
+    ordered = []
+    for _, intent in hits:
+        if intent not in ordered:
+            ordered.append(intent)
+    return ordered
+
+
 def order_no(text):
     m=re.search(r'\b(?:ORD|O)[A-Z0-9]{6,}\b',text,re.I); return m.group(0) if m else None

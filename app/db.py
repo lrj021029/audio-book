@@ -31,6 +31,7 @@ DDL = [
         awaiting_resume TINYINT(1) NOT NULL DEFAULT 0,
         focused_object_json JSON NULL,
         pending_query VARCHAR(64) NULL,
+        pending_commands_json JSON NULL,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_task_state_session FOREIGN KEY(session_id) REFERENCES chat_session(id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
@@ -55,6 +56,7 @@ def initialize():
             _ensure_column(cur, 'chat_task_state', 'awaiting_resume', 'TINYINT(1) NOT NULL DEFAULT 0')
             _ensure_column(cur, 'chat_task_state', 'focused_object_json', 'JSON NULL')
             _ensure_column(cur, 'chat_task_state', 'pending_query', 'VARCHAR(64) NULL')
+            _ensure_column(cur, 'chat_task_state', 'pending_commands_json', 'JSON NULL')
             _ensure_column(cur, 'chat_session', 'user_id', 'BIGINT NULL')
             _ensure_column(cur, 'chat_session', 'title', "VARCHAR(120) NOT NULL DEFAULT '新会话'")
             _ensure_column(cur, 'chat_message', 'turn_id', 'VARCHAR(36) NULL')
@@ -99,8 +101,8 @@ def create_session(session_id, user_id, title='新会话'):
         with c.cursor() as cur:
             cur.execute('INSERT INTO chat_session(id,user_id,title) VALUES(%s,%s,%s)', (session_id, user_id, title))
             cur.execute(
-                'INSERT INTO chat_task_state(session_id,current_task,slots_json,suspended_stack_json,awaiting_resume,focused_object_json,pending_query) '
-                'VALUES(%s,NULL,%s,%s,0,NULL,NULL)',
+                'INSERT INTO chat_task_state(session_id,current_task,slots_json,suspended_stack_json,awaiting_resume,focused_object_json,pending_query,pending_commands_json) '
+                'VALUES(%s,NULL,%s,%s,0,NULL,NULL,NULL)',
                 (session_id, '{}', '[]'),
             )
     finally:
@@ -166,7 +168,7 @@ def clear_history(session_id, user_id):
             cur.execute('DELETE m FROM chat_message m JOIN chat_session s ON s.id=m.session_id WHERE s.id=%s AND s.user_id=%s', (session_id, user_id))
             cur.execute(
                 """UPDATE chat_task_state st JOIN chat_session s ON s.id=st.session_id
-                   SET st.current_task=NULL,st.slots_json='{}',st.suspended_stack_json='[]',st.awaiting_resume=0,st.focused_object_json=NULL,st.pending_query=NULL
+                   SET st.current_task=NULL,st.slots_json='{}',st.suspended_stack_json='[]',st.awaiting_resume=0,st.focused_object_json=NULL,st.pending_query=NULL,st.pending_commands_json=NULL
                    WHERE s.id=%s AND s.user_id=%s""",
                 (session_id, user_id),
             )
@@ -220,7 +222,7 @@ def get_state(session_id, user_id):
     try:
         with c.cursor() as cur:
             cur.execute(
-                'SELECT st.current_task,st.slots_json,st.suspended_stack_json,st.awaiting_resume,st.focused_object_json,st.pending_query '
+                'SELECT st.current_task,st.slots_json,st.suspended_stack_json,st.awaiting_resume,st.focused_object_json,st.pending_query,st.pending_commands_json '
                 'FROM chat_task_state st JOIN chat_session s ON s.id=st.session_id '
                 'WHERE st.session_id=%s AND s.user_id=%s',
                 (session_id, user_id),
@@ -231,7 +233,7 @@ def get_state(session_id, user_id):
 
 
 def persist_turn(session_id, turn_id, user_text, user_metadata, assistant_text, assistant_metadata,
-                 task, slots, stack, awaiting_resume, focused_object, pending_query=None):
+                 task, slots, stack, awaiting_resume, focused_object, pending_query=None, pending_commands=None):
     """Persist both messages and the resulting dialogue state as one transaction."""
     c = connect()
     try:
@@ -242,10 +244,10 @@ def persist_turn(session_id, turn_id, user_text, user_metadata, assistant_text, 
                 raise RuntimeError('会话任务状态不存在，无法提交本轮对话')
             cur.execute(
                 'UPDATE chat_task_state SET current_task=%s,slots_json=%s,suspended_stack_json=%s,'
-                'awaiting_resume=%s,focused_object_json=%s,pending_query=%s WHERE session_id=%s',
+                'awaiting_resume=%s,focused_object_json=%s,pending_query=%s,pending_commands_json=%s WHERE session_id=%s',
                 (task, json.dumps(slots, ensure_ascii=False), json.dumps(stack, ensure_ascii=False),
                  int(awaiting_resume), json.dumps(focused_object, ensure_ascii=False) if focused_object else None,
-                 pending_query, session_id),
+                 pending_query, json.dumps(pending_commands or [], ensure_ascii=False), session_id),
             )
             cur.execute(
                 'INSERT INTO chat_message(session_id,turn_id,role,content,metadata_json) VALUES(%s,%s,%s,%s,%s)',
@@ -267,13 +269,13 @@ def persist_turn(session_id, turn_id, user_text, user_metadata, assistant_text, 
         c.close()
 
 
-def put_state(session_id, task, slots, stack, awaiting_resume=False, focused_object=None):
+def put_state(session_id, task, slots, stack, awaiting_resume=False, focused_object=None, pending_commands=None):
     c = connect()
     try:
         with c.cursor() as cur:
             cur.execute(
-                'UPDATE chat_task_state SET current_task=%s,slots_json=%s,suspended_stack_json=%s,awaiting_resume=%s,focused_object_json=%s WHERE session_id=%s',
-                (task, json.dumps(slots, ensure_ascii=False), json.dumps(stack, ensure_ascii=False), int(awaiting_resume), json.dumps(focused_object, ensure_ascii=False) if focused_object else None, session_id),
+                'UPDATE chat_task_state SET current_task=%s,slots_json=%s,suspended_stack_json=%s,awaiting_resume=%s,focused_object_json=%s,pending_commands_json=%s WHERE session_id=%s',
+                (task, json.dumps(slots, ensure_ascii=False), json.dumps(stack, ensure_ascii=False), int(awaiting_resume), json.dumps(focused_object, ensure_ascii=False) if focused_object else None, json.dumps(pending_commands or [], ensure_ascii=False), session_id),
             )
     finally:
         c.close()

@@ -17,7 +17,7 @@
 }
 ```
 
-`objects` 可为空。对象包含 `type`、`id`、`title` 等业务卡片信息；订单对象还可含 `orderNo/orderId`。最新对象被写入会话 `focused_object`。`turnId` 可省略。
+`objects` 可为空。对象包含 `type`、`id`、`title` 等业务卡片信息；订单对象还可含 `orderNo/orderId`。最新对象被写入会话 `focused_object`。后端会把卡片核心字段展开到 Planner 上下文和历史消息中，例如订单的 `order_id/status/amount`、专辑的 `title/rating/track_count`。`turnId` 可省略。
 
 响应示例（首次进入退款流程）：
 
@@ -29,7 +29,8 @@
     "current_task": "refund_request",
     "slots": {},
     "suspended_stack": [],
-    "awaiting_resume": false
+    "awaiting_resume": false,
+    "pending_commands": []
   },
   "intent": {"track": "slot_prompt"},
   "source": null,
@@ -54,7 +55,7 @@ data: {"turnId":"turn-20261111-001","text":"请提供订单号。"}
 
 ```text
 event: done
-data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"current_task":"refund_request","slots":{},"suspended_stack":[],"awaiting_resume":false,"pending_query":null,"focused_object":null},"intent":{"track":"slot_prompt"},"source":null,"cards":[]}
+data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"current_task":"refund_request","slots":{},"suspended_stack":[],"awaiting_resume":false,"pending_commands":[],"pending_query":null,"focused_object":null},"intent":{"track":"slot_prompt"},"source":null,"cards":[]}
 ```
 
 ## `GET /session/{session_id}/history`
@@ -91,12 +92,13 @@ data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"
   "slots": {"order_id": "ORD000000000001"},
   "suspended_stack": [],
   "awaiting_resume": false,
+  "pending_commands": [],
   "pending_query": null,
   "focused_object": {"type":"album","id":123,"title":"人生长恨水长东"}
 }
 ```
 
-没有已聚焦对象时 `focused_object` 为 `null`。`pending_query` 为可空流程状态字段。每次附加新对象会更新当前会话的聚焦对象。
+没有已聚焦对象时 `focused_object` 为 `null`。`pending_query` 为可空流程状态字段。`pending_commands` 保存因当前流程等待槽位而暂存的后续任务命令，例如多意图排队中的下一个 `StartFlow`；没有待执行命令时为空数组。每次附加新对象会更新当前会话的聚焦对象；知识回答不会清空聚焦对象。
 
 ## 会话与目录接口
 

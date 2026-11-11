@@ -58,10 +58,14 @@ docker compose exec -T mysql mysql -uroot -pcommerce2026 audio_data -N -e "SELEC
 
 ## 对话能力
 
-- 轨道规划：`TurnPlanner` 可请求受限 JSON 计划，`TurnPlanValidator` 校验后由 `TurnExecutor` 执行；LLM 不可用时使用确定性规则计划，计划无效时转为澄清。业务动作由 Python Action 和 audio-data API 执行。
+- 轨道规划：`TurnPlanner` 可请求受限 JSON 计划，`TurnPlanValidator` 规范化并校验后由 `TurnExecutor` 执行；LLM 不可用或输出不可修复时使用确定性规则计划。Executor 不再用关键词二次判断取消、继续、闲聊或跨流程意图，只执行校验后的任务命令。
 - 对话轨道：Task（订单/播放查询、退款、工单、购买引导）、Knowledge（专辑/会员/FAQ 单轮问答）、Chitchat（闲聊与情绪表达）。Chitchat 优先用 LLM 生成自然回复，未配置或失败时使用情境化回退。
-- 业务对象：前端对象随用户消息保存为历史卡片；后端维护会话级 `focused_object`，无明确指令时先确认收到并追问目标。订单对象可以填充退款/工单槽位。
-- 流程控制：`app/flow_config/user_flows.yml` 定义退款、工单、订单/播放查询和购买引导流程。退款槽位为 `order_id/refund_reason/refund_type`，部分退款增加 `refund_amount`；工单槽位为 `ticket_type/order_id/issue_desc`。任务状态支持挂起、恢复和取消。
+- 业务卡片上下文：用户消息中的订单、专辑、播放卡片会展开核心 JSON 字段后写入历史与 Planner Prompt，例如 `order_id/status/amount`、`title/rating/track_count`。当前聚焦对象的真实字段也会注入 Planner，支持“这个评分高吗”“这个订单能退吗”等追问。
+- 槽位锁定：当前流程正在收集槽位时，普通文本作为该槽位值交给 Planner 生成 `SetSlots`，Executor 不做词库式闲聊拦截。Planner 只做窄修复：补当前锁定槽位、为首轮明确订单号补 `order_id`、确认附件对象；不会自行切换流程，也不会提前启动 `pending_commands` 中的排队任务。
+- 流程控制：`app/flow_config/user_flows.yml` 定义退款、工单、订单/播放查询和购买引导流程。任务状态支持挂起、恢复、放弃和取消；任务完成后若存在挂起任务，会明确要求用户选择“继续任务名”或“放弃任务名”，放弃会清理整个挂起队列。
+- 多意图排队：同一轮中的连续 `StartFlow` 会按顺序执行；当前流程需要补充槽位时，后续流程暂存到 `pending_commands`，当前流程完成后自动继续。
+- 宽容校验：`SetSlots` 中未定义槽位只告警并丢弃，不直接转澄清；只有流程 ID 不存在或触发 `MULTIPLE_TRACKS` 等无法安全执行的情况才进入澄清。
+- 错误降级：退款/工单 Action 遇到明确业务拒绝（订单状态不可退、无成功支付记录等）会返回原因并把状态机重置为空闲；网络超时或上游 5xx 则保留当前流程和已填槽位，提示稍后重试。
 - LLM：可用于受限计划、闲聊回复和 FAQ/RAG 回复润色；配置兼容 OpenAI 的 DashScope 地址、`qwen-max` 与 `LLM_API_KEY`。业务动作不会由模型直接执行。
 - SAG-Wiki：客服 API 以子进程调用 `sag`，超时 10 秒；非零退出、空结果或缺少 CLI 时回落至 `knowledge/` 本地中文 bigram BM25 召回。
 
@@ -82,7 +86,7 @@ docker compose exec -T mysql mysql -uroot -pcommerce2026 audio_data -N -e "SELEC
 - `DELETE /session/{id}`：删除会话及其消息和状态。
 - `DELETE /session/{id}/history`：清空消息并重置流程状态。
 - `GET /session/{id}/history`：按 Turn 读取持久化问答，返回 `turns[]`；每轮含 `turn_id`、`user` 与 `assistant[]` 文本/卡片块。升级时会把旧消息归并到原用户消息对应的轮次。
-- `GET /session/{id}/state`：读取当前任务、槽位与挂起栈。
+- `GET /session/{id}/state`：读取当前任务、槽位、挂起栈和待执行命令队列。
 - `POST /chat`：JSON `{ "sessionId": "…", "message": "…", "objects": [] }`，返回完整回复、意图与状态。
 - `POST /chat/stream`：请求可带前端生成的 `turnId`，SSE 的 `token` 与 `done` 均带回该轮 ID。
 - `GET /catalog/orders`、`GET /catalog/albums`：按当前 `X-User-Id` 查询可附加的真实订单和专辑；工作台的业务对象选择器只展示接口返回的数据。
@@ -99,6 +103,13 @@ cp tests/.env.test.example tests/.env.test
 ```
 
 变量：`CS_BASE_URL`、`AUDIO_DATA_BASE_URL`、`LISTEN_CS_DSN`、`LLM_API_KEY`、`SAG_JEV_URL`、`SAG_JEV_KEY`。`.env` 与 `.env.test` 均不应提交。
+
+引擎单元测试不依赖真实 MySQL 或 LLM，可在已构建的客服镜像中挂载代码运行：
+
+```bash
+docker compose run --rm -v "$PWD:/srv" customer-service \
+  python -m unittest discover -s tests -v
+```
 
 ## 生产环境使用说明
 

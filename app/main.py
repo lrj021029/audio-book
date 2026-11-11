@@ -76,7 +76,7 @@ def get_state(session_id:str,x_user_id: str|None=Header(default=None)):
     uid=user_id(x_user_id); s=db.get_state(session_id,uid)
     if s is None: raise HTTPException(404,'会话不存在')
     def unpack(v): return json.loads(v or ('[]' if isinstance(v,str) and v.startswith('[') else '{}')) if isinstance(v,str) else v
-    return {'sessionId':session_id,'userId':uid,'current_task':s['current_task'],'slots':unpack(s['slots_json']),'suspended_stack':unpack(s['suspended_stack_json']),'awaiting_resume':bool(s['awaiting_resume']),'pending_query':s.get('pending_query'),'focused_object':unpack(s.get('focused_object_json'))}
+    return {'sessionId':session_id,'userId':uid,'current_task':s['current_task'],'slots':unpack(s['slots_json']),'suspended_stack':unpack(s['suspended_stack_json']),'awaiting_resume':bool(s['awaiting_resume']),'pending_query':s.get('pending_query'),'pending_commands':unpack(s.get('pending_commands_json')) or [],'focused_object':unpack(s.get('focused_object_json'))}
 @app.get('/catalog/orders')
 def catalog_orders(x_user_id: str|None=Header(default=None)):
     data=AudioDataClient(user_id(x_user_id)).get('/api/v1/orders',pageSize=30)

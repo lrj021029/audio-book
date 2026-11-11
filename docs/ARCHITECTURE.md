@@ -69,9 +69,9 @@ flowchart TD
 
 入口位于 `app/engine/__init__.py`，核心编排器是 `app/engine/executor.py::TurnExecutor`。
 
-1. `TurnPlanner` 汇总最近对话、任务状态、聚焦对象和 YAML 流程摘要。配置 `LLM_API_KEY` 时请求受限 JSON 计划；无凭证或调用失败时由规则生成候选计划。
-2. `TurnPlanValidator` 校验计划轨道、字段、任务命令、流程名、槽位和挂起任务恢复目标。校验失败时交由 `ClarifyResponder` 生成澄清，不执行无效计划。
-3. `TurnExecutor` 对槽位收集施加确定性约束：当前需要的槽位优先接收用户输入；取消、继续、明确的跨流程请求和明显闲聊另行处理。LLM 只协助路由与表达，不能直接执行退款或工单。
+1. `TurnPlanner` 汇总最近对话、任务状态、聚焦对象和 YAML 流程摘要。用户消息中的订单、专辑、播放卡片会先展开核心 JSON 字段再进入 Prompt；当前聚焦对象的真实字段也会注入。配置 `LLM_API_KEY` 时请求受限 JSON 计划；无凭证、调用失败或输出不可修复时由规则生成候选计划。
+2. `TurnPlanValidator` 校验并规范化计划。轨道、流程 ID 和命令顺序属于安全边界；未定义槽位、无效槽位值、失效的 `ResumeTask` 等只告警并丢弃，不直接转澄清。只有流程不存在或触发 `MULTIPLE_TRACKS` 等无法安全执行的情况才交由 `ClarifyResponder`。
+3. `TurnExecutor` 不再根据用户文本做 `_is_cancel`、`_is_resume`、`_is_chitchat` 等二次判断。只要计划通过校验，Executor 就按 `task_commands` 执行；槽位锁定由 Planner 的 `SetSlots` 和 Validator 的规范化保证。Planner 的修复范围仅限于当前锁定槽位、首轮消息中的明确订单号、附件对象确认，以及阻止模型提前启动 `pending_commands` 中的排队任务。
 4. 任务流程由 `FlowCatalog` 从 `app/flow_config/user_flows.yml` 加载并验证。`collect`、`action`、`response` 等步骤由执行器驱动；Action 名称通过 Python 注册表映射到确定性函数。
 5. 业务查询和写操作由 `app/engine/business.py` 与 `app/audio_client.py` 调用 audio-data。FAQ 检索由 `app/retrieval.py` 先尝试 SAG CLI，再回退至本地 `knowledge/*.md`；可选 LLM 仅用于 FAQ 回复润色或闲聊/规划。
 
@@ -93,17 +93,19 @@ flowchart TD
   AM --> A
   A --> V{业务 API 成功？}
   V -- 是 --> DONE[返回退款单号/状态并结束]
-  V -- 否 --> KEEP[保留已填信息并返回错误]
+  V -- 明确业务拒绝 --> RESET[返回原因并重置为空闲]
+  V -- 超时或上游 5xx --> KEEP[保留已填信息并提示重试]
 ```
 
-执行 Action 时，退款业务会由 audio-data 校验订单归属、支付记录和退款明细；工单也通过业务 API 创建。Action 失败时会保留当前流程及已收集槽位，供后续继续处理。
+执行 Action 时，退款业务会由 audio-data 校验订单归属、支付记录和退款明细；工单也通过业务 API 创建。明确业务拒绝（订单状态不可退、无成功支付记录、金额非法等）会重置 `current_task` 和槽位，避免死循环；网络超时或上游暂不可用会保留当前流程及已收集槽位。
 
-## 任务中断、恢复与对象聚焦
+## 任务中断、恢复、放弃与队列
 
-- `chat_task_state` 保存 `current_task`、`slots_json`、`suspended_stack_json`、`awaiting_resume`、`focused_object_json` 和 `pending_query`。
-- 明确发起另一项 Task 时，当前任务及槽位快照压入挂起栈；查询子任务完成后可恢复之前的任务，并询问用户是否继续。栈按后进先出方式恢复。
-- “取消”清空当前流程和挂起状态；活动流程中的“继续”会重新显示当前流程提示，等待恢复时的“继续”则恢复栈顶任务。
-- 附加订单或专辑会先向业务 API 解析详情，并保存为聚焦对象。订单对象可填充流程的 `order_id`；仅附加对象时客服会确认收到并询问希望执行的操作。历史消息保存解析后的对象，前端可重绘对象卡片。
+- `chat_task_state` 保存 `current_task`、`slots_json`、`suspended_stack_json`、`awaiting_resume`、`focused_object_json`、`pending_commands_json` 和 `pending_query`。
+- 明确发起另一项 Task 时，当前任务、槽位和聚焦对象快照压入挂起栈；查询子任务完成后，系统会列出挂起任务，要求用户明确选择“继续 任务名”或“放弃 任务名”。`AbandonTask` 会清空整个挂起栈。
+- “取消”清空当前流程、槽位、挂起栈和待执行队列；活动流程中的“继续”由 Planner 决定是重复当前提示还是恢复挂起任务。
+- 同一轮中的连续 `StartFlow` 形成有序任务队列。当前流程需要补充槽位时，后续命令暂存到 `pending_commands_json`；当前流程完成后自动继续。多个流程的结果会合并到同一轮回复，不覆盖前一个任务结果。
+- 附加订单或专辑会先向业务 API 解析详情，并保存为聚焦对象。订单对象可通过 Planner 的 `SetSlots` 填充 `order_id`；历史消息和 Planner Prompt 都保存展开后的卡片核心字段。知识回答不再清空聚焦对象，便于连续追问评分、作者、进度等信息。
 
 ## 持久化与一致性
 
@@ -116,9 +118,11 @@ flowchart TD
 | 模块 | 职责 |
 |---|---|
 | `app/main.py` | FastAPI 路由、用户范围校验、同步及 SSE 聊天接口。 |
-| `app/engine/executor.py` | 状态读取、计划校验、流程执行、业务 Action 调度和轮次提交。 |
-| `app/engine/planner.py` | LLM 计划请求及确定性规则回退。 |
-| `app/engine/validator.py` | 计划 schema、命令和上下文约束校验。 |
+| `app/engine/executor.py` | 状态读取、计划校验、命令队列、流程执行、Action 错误分层和轮次提交。 |
+| `app/engine/planner.py` | LLM 计划请求、卡片上下文注入及确定性规则回退。 |
+| `app/engine/validator.py` | 计划 schema、命令顺序、槽位规范化和 `MULTIPLE_TRACKS` 安全边界。 |
+| `app/engine/clarify.py` | 基于缺失槽位、挂起栈和历史上下文的精准澄清。 |
+| `app/engine/history_builder.py` | 历史消息与业务卡片核心字段渲染。 |
 | `app/engine/configuration.py` | 加载和校验 YAML 流程目录。 |
 | `app/engine/business.py` | 业务查询、退款/工单写入、FAQ 与卡片辅助逻辑。 |
 | `app/audio_client.py` | 带用户编号的 audio-data HTTP 客户端，超时 10 秒。 |
