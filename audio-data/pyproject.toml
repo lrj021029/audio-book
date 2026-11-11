@@ -1,0 +1,30 @@
+[project]
+name = "audio-data"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "pydantic>=2.12.5",
+  "pymysql>=1.1.2",
+  "python-dotenv>=1.1.1",
+  "rich>=14.2.0",
+  "tzdata>=2026.2",
+  "uvicorn>=0.34.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28.1",
+  "pyright>=1.1.409",
+  "pytest>=9.0.3",
+  "ruff>=0.15.15",
+]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"

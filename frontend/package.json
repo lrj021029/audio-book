@@ -1,0 +1,1 @@
+{"name":"listen-cs-workbench","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite --host 0.0.0.0","build":"vite build"},"dependencies":{"@vitejs/plugin-react":"latest","vite":"latest","react":"latest","react-dom":"latest","lucide-react":"^0.468.0","tailwindcss":"^4.0.0","@tailwindcss/vite":"^4.0.0"},"devDependencies":{}}
