@@ -31,18 +31,13 @@
     "suspended_stack": [],
     "awaiting_resume": false
   },
-  "intent": {
-    "intent": "refund_request",
-    "confidence": 0.67,
-    "runner_up": null,
-    "margin": 0.67
-  },
+  "intent": {"track": "slot_prompt"},
   "source": null,
   "cards": []
 }
 ```
 
-意图与轨道来自经校验的 LLM 计划或规则回退；查询回复会填充 `source`，需要展示的专辑/播放卡片放入 `cards`。
+`intent.track` 当前记录执行分支（例如 `slot_prompt`、`task_complete`、`knowledge`、`chitchat` 或 `clarify`），不返回底层分类器的置信度字段。查询回复会填充 `source`，需要展示的专辑/播放卡片放入 `cards`。
 
 ## `POST /chat/stream`
 
@@ -59,7 +54,7 @@ data: {"turnId":"turn-20261111-001","text":"请提供订单号。"}
 
 ```text
 event: done
-data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"current_task":"refund_request","slots":{},"suspended_stack":[],"awaiting_resume":false},"intent":{"intent":"refund_request","confidence":0.67,"runner_up":null,"margin":0.67},"source":null,"cards":[]}
+data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"current_task":"refund_request","slots":{},"suspended_stack":[],"awaiting_resume":false,"pending_query":null,"focused_object":null},"intent":{"track":"slot_prompt"},"source":null,"cards":[]}
 ```
 
 ## `GET /session/{session_id}/history`
@@ -74,9 +69,9 @@ data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"
       "turn_id": "turn-20261111-001",
       "user": {"text": "我要退款", "timestamp": "2026-11-11T09:30:00", "objects": []},
       "assistant": [
-        {"type": "text", "text": "请提供订单号。", "timestamp": "2026-11-11T09:30:00", "intent": {"intent": "refund_request"}, "source": null}
+        {"type": "text", "text": "请提供订单号。", "timestamp": "2026-11-11T09:30:00", "intent": {"track": "slot_prompt", "planner": "plan_validate_execute"}, "source": null}
       ],
-      "intent": {"intent": "refund_request"}
+      "intent": {"track": "slot_prompt", "planner": "plan_validate_execute"}
     }
   ]
 }
@@ -96,11 +91,12 @@ data: {"turnId":"turn-20261111-001","message":"请提供订单号。","state":{"
   "slots": {"order_id": "ORD000000000001"},
   "suspended_stack": [],
   "awaiting_resume": false,
+  "pending_query": null,
   "focused_object": {"type":"album","id":123,"title":"人生长恨水长东"}
 }
 ```
 
-没有已聚焦对象时 `focused_object` 为 `null`。每次附加新对象会更新当前会话的聚焦对象。
+没有已聚焦对象时 `focused_object` 为 `null`。`pending_query` 为可空流程状态字段。每次附加新对象会更新当前会话的聚焦对象。
 
 ## 会话与目录接口
 

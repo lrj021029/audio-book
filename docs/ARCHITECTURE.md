@@ -1,88 +1,134 @@
 # 系统架构设计
 
-## 系统边界与拓扑
+## 系统边界与部署拓扑
 
 ```mermaid
 flowchart LR
   subgraph Browser[浏览器]
-    React[React 工作台<br/>Vite + Nginx :8080]
+    UI[React 工作台]
   end
-  subgraph Backend[客服服务]
-    FastAPI[FastAPI :8001<br/>app/main.py]
-    Engine[对话引擎<br/>app/engine.py]
-    Retrieval[检索与 RAG<br/>app/retrieval.py / app/llm.py]
-    Client[AudioDataClient<br/>app/audio_client.py]
+  subgraph Compose[Docker Compose]
+    Nginx[Nginx 静态站点与 /api 代理 :8080]
+    CS[客服 FastAPI :8001]
+    Engine[TurnExecutor<br/>计划、校验、执行]
+    Catalog[FlowCatalog<br/>user_flows.yml]
+    CDB[(MySQL listen_cs)]
+    AD[Audio-data FastAPI :8000]
+    ADB[(MySQL audio_data)]
   end
-  subgraph Databases[MySQL]
-    CS[(listen_cs<br/>chat_session / chat_message / chat_task_state)]
-    AD[(audio_data<br/>业务表)]
-  end
-  SAG[SAG 知识检索服务 / CLI]
-  LocalKB[本地 knowledge/*.md 回退检索]
-  LLM[兼容 OpenAI 的 LLM API<br/>仅 FAQ 回复润色]
-  React -->|HTTP / SSE，经 Nginx 代理| FastAPI
-  FastAPI --> Engine
-  Engine -->|会话、消息、任务状态| CS
-  Engine --> Client
-  Client -->|HTTP JSON + X-User-Id| FastAPI2[Audio-data API :8000]
-  FastAPI2 -->|读写业务| AD
-  Engine --> Retrieval
-  Retrieval -->|sag 子进程，最多 10 秒| SAG
-  Retrieval -. CLI 不可用/无结果 .-> LocalKB
-  Retrieval -->|FAQ 命中段落| LLM
+  RAG[SAG CLI]
+  KB[knowledge/*.md<br/>本地 BM25 回退]
+  LLM[兼容 OpenAI 的 LLM API]
+
+  UI -->|同源 HTTP / SSE| Nginx
+  Nginx -->|/api 转发| CS
+  CS --> Engine
+  Engine -->|会话、历史、状态| CDB
+  Engine --> Catalog
+  Engine -->|业务查询及退款/工单写入| AD
+  AD --> ADB
+  Engine -->|FAQ 检索| RAG
+  RAG -. 不可用或无结果 .-> KB
+  Engine -->|可选：计划、闲聊、FAQ 润色| LLM
 ```
 
-图中 `FastAPI2` 是独立的 `audio-data` FastAPI 服务；本地 compose 里客服和业务 API 共用 MySQL 容器，但使用 `listen_cs` 与 `audio_data` 两个数据库。浏览器只访问工作台同源 `/api`，由 Nginx 代理客服 API。SAG 是外部知识检索入口；检索代码会在命令失败、超时或无输出时用项目本地 `knowledge/` Markdown 做 BM25 风格回退。LLM 凭证配置可选，且只用于 FAQ 命中内容的简洁改写。
+Compose 中的 `mysql` 是同一个 MySQL 容器，但客服库 `listen_cs` 和业务库 `audio_data` 由不同服务负责。客服服务不直接读写 `audio_data`，而是通过带 `X-User-Id` 的 `AudioDataClient` 调用业务 API。退款和工单也由业务 API 校验并写入。前端访问工作台同源地址，Nginx 将 `/api` 请求代理给客服 API。
 
-## 核心模块
+## 单轮对话流程
 
-### 意图识别
+下面展示从请求到持久化响应的主路径。状态读取、业务动作和知识检索会按计划选择；所有完成的轮次都在客服数据库事务中一起保存用户消息、客服回复与新状态。
 
-`app/intents.py::classify_intent` 通过关键词计分，产出 `intent`、`confidence`、`runner_up` 和 `margin`。`app/engine.py::run` 使用 `confidence >= 0.55` 且 `margin >= 0.15` 作为自动分流门槛。当前识别类别包括 `refund_request`、`ticket_submit`、`order_query`、`book_query`、`playback_query`、`membership_query`、`faq`、`chitchat` 与 `unknown`。
+```mermaid
+flowchart TD
+  A[前端发送消息、附件和 turnId] --> B[Nginx 转发至客服 API]
+  B --> C[校验 X-User-Id 与会话归属]
+  C --> D[TurnExecutor 读取任务状态]
+  D --> E{有业务对象附件？}
+  E -- 有 --> F[解析专辑/订单详情并更新聚焦对象]
+  E -- 无 --> G[TurnPlanner 生成候选计划]
+  F --> G
+  G --> H{计划合法？}
+  H -- 否 --> I[ClarifyResponder 安全澄清]
+  H -- 是 --> J{轨道}
+  J -- Task --> K[执行 YAML 流程与 Python Action]
+  J -- Knowledge --> L[查询业务 API 或检索 FAQ]
+  J -- Chitchat --> M[可选 LLM 回复，失败时规则回退]
+  K --> N[得到回复、卡片和新任务状态]
+  L --> N
+  M --> N
+  I --> N
+  N --> O[事务保存两条消息与任务状态]
+  O --> P{请求 /chat/stream？}
+  P -- 是 --> Q[发送分块 token，最后发送 done]
+  P -- 否 --> R[返回 JSON]
+```
 
-对话引擎先形成三轨计划。配置有 LLM 时 `llm.plan_turn` 请求受限 JSON 计划，由允许的轨道/意图枚举校验；不合法或不可用时回到确定性规则。高置信度的显式业务关键词优先于模型建议。计划只负责路由，不直接执行业务动作；退款、工单仍由 Python Action 和槽位状态机执行。闲聊优先调用 LLM 自然语言生成；LLM 不可用时按情境给出非菜单式回应。
+`/chat/stream` 目前先同步执行完整轮次，之后将最终文本按每 20 个 Python 字符切块发送，因此提供的是分块传输，不是模型生成 token 与业务处理并行。请求可以携带 `turnId`；未提供时由服务端生成。用户消息与客服消息共用同一 `turn_id`。
 
-### 任务型状态机（Slot Filling）
+## 对话引擎：Plan → Validate → Execute
 
-任务定义位于 `engine.py` 的 `FLOW`、`PROMPT`：退款需要 `order_id/reason/refund_type`，工单需要 `ticket_type/order_id/description`。部分退款会动态增加 `refund_amount`。`extract_slot` 先识别附加订单和订单号，再按当前缺失槽位解析用户回答；`advance_task` 在槽位齐全后调用 `execute`，由 `AudioDataClient` 请求业务 API。退款/工单不会由 LLM 直接执行。
+入口位于 `app/engine/__init__.py`，核心编排器是 `app/engine/executor.py::TurnExecutor`。
 
-### 信息检索（业务 API 与 RAG）
+1. `TurnPlanner` 汇总最近对话、任务状态、聚焦对象和 YAML 流程摘要。配置 `LLM_API_KEY` 时请求受限 JSON 计划；无凭证或调用失败时由规则生成候选计划。
+2. `TurnPlanValidator` 校验计划轨道、字段、任务命令、流程名、槽位和挂起任务恢复目标。校验失败时交由 `ClarifyResponder` 生成澄清，不执行无效计划。
+3. `TurnExecutor` 对槽位收集施加确定性约束：当前需要的槽位优先接收用户输入；取消、继续、明确的跨流程请求和明显闲聊另行处理。LLM 只协助路由与表达，不能直接执行退款或工单。
+4. 任务流程由 `FlowCatalog` 从 `app/flow_config/user_flows.yml` 加载并验证。`collect`、`action`、`response` 等步骤由执行器驱动；Action 名称通过 Python 注册表映射到确定性函数。
+5. 业务查询和写操作由 `app/engine/business.py` 与 `app/audio_client.py` 调用 audio-data。FAQ 检索由 `app/retrieval.py` 先尝试 SAG CLI，再回退至本地 `knowledge/*.md`；可选 LLM 仅用于 FAQ 回复润色或闲聊/规划。
 
-订单、专辑、播放、会员等查询通过 `answer` 使用 `AudioDataClient` 调用 audio-data API；退款及工单通过 `execute` 调用业务写接口。FAQ 由 `retrieve` 调用 SAG，无法使用时回退本地 Markdown 匹配，再由 `rag_reply` 可选润色。检索出的段落会附在回复中，保留来源信息。客服服务不直接访问或写入 `audio_data` 数据库。
+### 流程配置和槽位
 
-### Turn 与状态持久化
+流程和槽位定义已经外置为 YAML，不是硬编码在 Python `FLOW` 常量中。当前流程包括退款、工单、订单查询、播放进度查询和购买引导。退款流程收集 `order_id`、`refund_reason`、`refund_type`；部分退款还需要 `refund_amount`。工单流程收集 `ticket_type`、可选订单号 `order_id`（无订单时可填 `none`）和 `issue_desc`。
 
-系统没有独立的 Turn ORM/领域类。`run` 为一轮生成或接收 `turn_id`，将用户消息和客服消息分别写入 `chat_message`，二者共享此 ID；回复中的意图、来源、卡片及状态快照放在 JSON 元数据中。`GET /session/{id}/history` 按 `turn_id` 聚合为前端所需的轮次结构。当前流程状态单独以整份 JSON 写入 `chat_task_state`，重启后由 `get_state` 恢复。
+```mermaid
+flowchart TD
+  S[开始退款] --> O{有订单号？}
+  O -- 否 --> OQ[询问订单号]
+  O -- 是 --> R{有退款原因？}
+  OQ --> R
+  R -- 否 --> RQ[询问退款原因]
+  R -- 是 --> T{退款类型}
+  RQ --> T
+  T -- 全额 --> A[提交退款 Action]
+  T -- 部分 --> AM[询问退款金额]
+  AM --> A
+  A --> V{业务 API 成功？}
+  V -- 是 --> DONE[返回退款单号/状态并结束]
+  V -- 否 --> KEEP[保留已填信息并返回错误]
+```
 
-## 轨道与状态栈
+执行 Action 时，退款业务会由 audio-data 校验订单归属、支付记录和退款明细；工单也通过业务 API 创建。Action 失败时会保留当前流程及已收集槽位，供后续继续处理。
 
-这是当前实现的分流视图；任务/槽位约束仍在 Python 中定义，尚未外置为 YAML：
+## 任务中断、恢复与对象聚焦
 
-| 轨道 | 责任 | 例子 | 实现 |
-|---|---|---|---|
-| Task | 状态化业务任务，包含查询型任务和多轮 Action | 查订单、查播放记录、退款、工单、购买意图导引 | `FLOW`、`extract_slot`、`advance_task`、`execute` |
-| Knowledge | 单轮专辑、会员或规则问答 | 查专辑、会员权益、退款政策 | `answer`、`retrieve`、`rag_reply` |
-| Chitchat | 情绪和闲聊，不调用业务 API | “我非常开心”、问候、感谢 | `plan_turn`、`llm.chitchat_reply`，规则回退 |
-| Clarification | 仍无法识别时做简短澄清 | 未覆盖意图 | `run`，不再返回固定业务菜单 |
+- `chat_task_state` 保存 `current_task`、`slots_json`、`suspended_stack_json`、`awaiting_resume`、`focused_object_json` 和 `pending_query`。
+- 明确发起另一项 Task 时，当前任务及槽位快照压入挂起栈；查询子任务完成后可恢复之前的任务，并询问用户是否继续。栈按后进先出方式恢复。
+- “取消”清空当前流程和挂起状态；活动流程中的“继续”会重新显示当前流程提示，等待恢复时的“继续”则恢复栈顶任务。
+- 附加订单或专辑会先向业务 API 解析详情，并保存为聚焦对象。订单对象可填充流程的 `order_id`；仅附加对象时客服会确认收到并询问希望执行的操作。历史消息保存解析后的对象，前端可重绘对象卡片。
 
-任务中断与恢复规则：
+## 持久化与一致性
 
-1. 用户开始退款后，`current_task=refund_request`，槽位逐轮保存在 `slots_json`。
-2. 若退款尚未完成时用户明确要求查订单/播放/会员等，`run` 将当前任务与槽位快照 Push 到 `suspended_stack`，处理查询，然后 Pop 最近快照并询问是否继续。
-3. 用户回复“继续”时，`awaiting_resume` 被清除，并重新询问当前任务第一个缺失槽位；拒绝/取消则由全局取消规则清空任务和栈。
-4. 若当前任务的槽位已完整，`advance_task` 执行当前任务；成功后若栈非空则 Pop 并恢复挂起任务。
-5. 用户明确开始另一种任务时，旧任务快照 Push，新任务变为当前任务。
+客服库由 `app/db.py` 管理，包含 `chat_session`、`chat_message`、`chat_task_state` 三张表。`persist_turn` 在一个 MySQL 事务中锁定会话状态行，并一起更新任务状态、写入共享 `turn_id` 的用户/客服消息、更新会话活动时间。事务只覆盖客服自己的数据；audio-data 的业务动作是独立 HTTP 请求，不与客服库事务构成分布式事务。
 
-这类似 LIFO 栈，但 `restore_after_subtask` 在一次调用中 Pop 一个元素。恢复行为有显式确认状态 `awaiting_resume`。购买目前没有下单 Action：退款中收到购买意图时，退款快照入栈，系统回到 Idle 并引导用户去听书客户端购买；用户回复“继续”可恢复退款。
+启动时 `db.initialize()` 会创建表、补齐新增列、迁移旧消息的 `turn_id` 并回填旧会话的默认用户编号。`GET /session/{id}/history` 将消息按 `turn_id` 聚合为轮次，`GET /session/{id}/state` 返回持久化流程快照。
 
-## focused_object 业务对象聚焦
+## 主要模块
 
-每轮请求包含 `objects` 时，引擎先规范化最新对象并将它保存为会话 `focused_object`，同时写入该轮用户消息 `metadata_json.objects`。`chat_task_state.focused_object_json` 保存最新聚焦对象，状态 API 将它返回。无明确动作时，客服按对象类型和标题确认收到并询问用户目标；订单对象可以填充退款/工单的订单号槽位。历史 API 将附件同时作为 `user.objects` 和 `user.cards` 返回，React 时间线据此渲染用户消息中的业务卡片。
+| 模块 | 职责 |
+|---|---|
+| `app/main.py` | FastAPI 路由、用户范围校验、同步及 SSE 聊天接口。 |
+| `app/engine/executor.py` | 状态读取、计划校验、流程执行、业务 Action 调度和轮次提交。 |
+| `app/engine/planner.py` | LLM 计划请求及确定性规则回退。 |
+| `app/engine/validator.py` | 计划 schema、命令和上下文约束校验。 |
+| `app/engine/configuration.py` | 加载和校验 YAML 流程目录。 |
+| `app/engine/business.py` | 业务查询、退款/工单写入、FAQ 与卡片辅助逻辑。 |
+| `app/audio_client.py` | 带用户编号的 audio-data HTTP 客户端，超时 10 秒。 |
+| `app/retrieval.py`、`app/llm.py` | SAG/本地知识检索及可选 LLM 能力。 |
+| `app/db.py` | 客服表结构迁移、轮次与状态事务持久化。 |
+| `frontend/src/main.jsx` | React 工作台、聊天请求及 SSE 消费。 |
+| `frontend/nginx/default.conf` | 静态资源和 `/api` 反向代理。 |
 
-## 当前设计边界与演进方向
+## 已知边界
 
-- 持续扩充路由 schema 与规则回退，为规划结果保留可审计日志和回归用例。
-- 将 LLM 规划输出校验进一步细化到槽位和 Action 参数；业务动作仍由确定性 Python Action 执行。
-- 将轨道和槽位约束外置 YAML，并保留 Python Action 注册表，便于业务流程审阅和版本化。
-- 为附件对象扩充类型/ID 校验与上下文查询；目前已有 focused object 持久化和历史卡片回放，但专辑对象不会自动触发专辑详情查询。
-- 将消息写入、状态更新与业务副作用的幂等策略进一步明确；目前 `run` 先落用户消息再处理，写消息和状态不是一个数据库事务。
+- LLM 规划和知识润色均为可选能力；没有凭证或调用失败时依赖规则回退/本地检索。
+- 客服数据库事务不能回滚已由 audio-data 成功完成的外部业务写入；跨服务重试和幂等由业务 API 负责。
+- `/chat/stream` 在完整轮次处理完成后才发送文本分块。

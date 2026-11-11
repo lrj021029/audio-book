@@ -44,9 +44,10 @@
 | `suspended_stack_json` | `JSON` | 非空 | 被中断任务及槽位快照的 LIFO 数组。 |
 | `awaiting_resume` | `TINYINT(1)` | 非空，默认 `0` | 是否等待用户确认恢复挂起任务。 |
 | `focused_object_json` | `JSON` | 可空 | 当前会话最近一次聚焦的专辑/订单等业务对象。 |
+| `pending_query` | `VARCHAR(64)` | 可空 | 可选的待处理查询状态；当前接口会读取该字段。 |
 | `updated_at` | `DATETIME` | 当前时间，更新时自动刷新 | 最近状态更新时刻。 |
 
-`create_session` 同时创建初始状态（`current_task=NULL`、`slots_json={}`、`suspended_stack_json=[]`、`focused_object_json=NULL`）。`put_state` 每轮处理完成后更新完整快照。清空历史会同时清空状态和聚焦对象；删除会话会删除消息、状态和会话。
+`create_session` 同时创建初始状态（`current_task=NULL`、`slots_json={}`、`suspended_stack_json=[]`、`focused_object_json=NULL`、`pending_query=NULL`）。`persist_turn` 在单个 MySQL 事务里锁定任务状态行，并同时更新流程状态、写入同一 `turn_id` 下的用户与客服消息及更新会话时间。清空历史会同时清空状态和聚焦对象；删除会话会删除消息、状态和会话。
 
 ## 数据责任
 

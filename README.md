@@ -58,18 +58,16 @@ docker compose exec -T mysql mysql -uroot -pcommerce2026 audio_data -N -e "SELEC
 
 ## 对话能力
 
-- 轨道规划：LLM 可输出受限 JSON 轨道/意图计划，由服务端枚举校验；模型不可用或计划无效时回退关键词规则。显式业务关键词由规则优先，业务动作始终由确定性 Python 状态机与 API 执行。
+- 轨道规划：`TurnPlanner` 可请求受限 JSON 计划，`TurnPlanValidator` 校验后由 `TurnExecutor` 执行；LLM 不可用时使用确定性规则计划，计划无效时转为澄清。业务动作由 Python Action 和 audio-data API 执行。
 - 对话轨道：Task（订单/播放查询、退款、工单、购买引导）、Knowledge（专辑/会员/FAQ 单轮问答）、Chitchat（闲聊与情绪表达）。Chitchat 优先用 LLM 生成自然回复，未配置或失败时使用情境化回退。
 - 业务对象：前端对象随用户消息保存为历史卡片；后端维护会话级 `focused_object`，无明确指令时先确认收到并追问目标。订单对象可以填充退款/工单槽位。
-- 流程控制：由确定性状态机控制。退款槽位 `order_id/reason/refund_type`；工单槽位 `ticket_type/order_id/description`。任务切换时保存挂起栈，完成查询后回复“继续”恢复；“取消”清空当前任务。
-- LLM：用于受限轨道规划、闲聊自然语言回复和 FAQ/RAG 回复润色；配置兼容 OpenAI 的 DashScope 地址、`qwen-max` 与 `LLM_API_KEY`。规划结果经允许意图/轨道校验，调用失败时回退关键词规则；业务动作仍由确定性 Python 状态机执行。
+- 流程控制：`app/flow_config/user_flows.yml` 定义退款、工单、订单/播放查询和购买引导流程。退款槽位为 `order_id/refund_reason/refund_type`，部分退款增加 `refund_amount`；工单槽位为 `ticket_type/order_id/issue_desc`。任务状态支持挂起、恢复和取消。
+- LLM：可用于受限计划、闲聊回复和 FAQ/RAG 回复润色；配置兼容 OpenAI 的 DashScope 地址、`qwen-max` 与 `LLM_API_KEY`。业务动作不会由模型直接执行。
 - SAG-Wiki：客服 API 以子进程调用 `sag`，超时 10 秒；非零退出、空结果或缺少 CLI 时回落至 `knowledge/` 本地中文 bigram BM25 召回。
 
 ## 外部依赖说明
 
-Linux 容器环境因 SAG CLI 未提供原生二进制，默认使用 BM25 降级检索，需 Jev 请使用 mac/win 或等待官方更新。
-
-客服服务仍会尝试调用 `sag` CLI（10 秒超时）；CLI 缺失、非零退出或输出为空时，自动使用 `knowledge/` 文档的本地中文 bigram BM25 检索，并返回原文段落及来源路径。FAQ 检索可在工作台输入“会员能退款吗”验证。配置了 `LLM_API_KEY` 时，LLM 仅对命中的 FAQ 做回复润色；失败或超时会显示本地检索原文。
+客服服务会尝试调用 `sag` CLI（10 秒超时）；CLI 缺失、非零退出、超时或输出为空时，自动使用 `knowledge/` 文档的本地中文 bigram BM25 检索，并返回原文段落及来源路径。配置了 `LLM_API_KEY` 时，LLM 可对 FAQ 命中内容做回复润色；失败时使用检索结果。
 
 前端通过同源 `/api/` 路径请求客服服务，Nginx 在 8080 端口代理到 `customer-service:8001`，包含 SSE 流式响应，不需要浏览器跨域访问 8001。
 
@@ -90,7 +88,7 @@ Linux 容器环境因 SAG CLI 未提供原生二进制，默认使用 BM25 降�
 - `GET /catalog/orders`、`GET /catalog/albums`：按当前 `X-User-Id` 查询可附加的真实订单和专辑；工作台的业务对象选择器只展示接口返回的数据。
 - `GET /catalog/context`：返回当前用户资料、钱包、订单、书架、播放记录与热门专辑，供工作面板实时展示。
 
-消息日志记录意图及置信度、分支、槽位变化和总耗时；AudioDataClient 对 HTTP 调用设 10 秒超时并捕获失败。
+消息元数据保存执行轨道、来源、流程槽位、挂起栈和卡片；服务日志记录轨道、分支、任务、槽位、栈深度和耗时。AudioDataClient 对 HTTP 调用设 10 秒超时并捕获失败。
 
 ## 测试环境变量
 
